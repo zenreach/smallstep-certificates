@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -103,36 +104,42 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 	p2.Accounts = p1.Accounts
 	p2.config.identityURL = srv.URL + "/bad-document"
 	p2.config.signatureURL = p1.config.signatureURL
+	p2.config.tokenURL = p1.config.tokenURL
 
 	p3, err := generateAWS()
 	assert.FatalError(t, err)
 	p3.Accounts = p1.Accounts
 	p3.config.signatureURL = srv.URL
 	p3.config.identityURL = p1.config.identityURL
+	p3.config.tokenURL = p1.config.tokenURL
 
 	p4, err := generateAWS()
 	assert.FatalError(t, err)
 	p4.Accounts = p1.Accounts
 	p4.config.signatureURL = srv.URL + "/bad-signature"
 	p4.config.identityURL = p1.config.identityURL
+	p4.config.tokenURL = p1.config.tokenURL
 
 	p5, err := generateAWS()
 	assert.FatalError(t, err)
 	p5.Accounts = p1.Accounts
 	p5.config.identityURL = "https://1234.1234.1234.1234"
 	p5.config.signatureURL = p1.config.signatureURL
+	p5.config.tokenURL = p1.config.tokenURL
 
 	p6, err := generateAWS()
 	assert.FatalError(t, err)
 	p6.Accounts = p1.Accounts
 	p6.config.identityURL = p1.config.identityURL
 	p6.config.signatureURL = "https://1234.1234.1234.1234"
+	p6.config.tokenURL = p1.config.tokenURL
 
 	p7, err := generateAWS()
 	assert.FatalError(t, err)
 	p7.Accounts = p1.Accounts
 	p7.config.identityURL = srv.URL + "/bad-json"
 	p7.config.signatureURL = p1.config.signatureURL
+	p7.config.tokenURL = p1.config.tokenURL
 
 	caURL := "https://ca.smallstep.com"
 	u, err := url.Parse(caURL)
@@ -180,6 +187,49 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 	}
 }
 
+func TestAWS_GetIdentityToken_V1Only(t *testing.T) {
+	aws, srv, err := generateAWSWithServerV1Only()
+	assert.FatalError(t, err)
+	defer srv.Close()
+
+	subject := "foo.local"
+	caURL := "https://ca.smallstep.com"
+	u, err := url.Parse(caURL)
+	assert.Nil(t, err)
+
+	token, err := aws.GetIdentityToken(subject, caURL)
+	assert.Nil(t, err)
+
+	_, c, err := parseAWSToken(token)
+	if assert.NoError(t, err) {
+		assert.Equals(t, awsIssuer, c.Issuer)
+		assert.Equals(t, subject, c.Subject)
+		assert.Equals(t, jose.Audience{u.ResolveReference(&url.URL{Path: "/1.0/sign", Fragment: aws.GetID()}).String()}, c.Audience)
+		assert.Equals(t, aws.Accounts[0], c.document.AccountID)
+		err = aws.config.certificate.CheckSignature(
+			aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+		assert.NoError(t, err)
+	}
+}
+
+func TestAWS_GetIdentityToken_BadIDMS(t *testing.T) {
+	aws, srv, err := generateAWSWithServer()
+
+	aws.IMDSVersions = []string{"bad"}
+
+	assert.FatalError(t, err)
+	defer srv.Close()
+
+	subject := "foo.local"
+	caURL := "https://ca.smallstep.com"
+
+	token, err := aws.GetIdentityToken(subject, caURL)
+	assert.Equals(t, token, "")
+
+	badIDMS := errors.New("bad: not a supported AWS Instance Metadata Service version")
+	assert.HasSuffix(t, err.Error(), badIDMS.Error())
+}
+
 func TestAWS_Init(t *testing.T) {
 	config := Config{
 		Claims: globalProvisionerClaims,
@@ -196,6 +246,7 @@ func TestAWS_Init(t *testing.T) {
 		DisableCustomSANs      bool
 		DisableTrustOnFirstUse bool
 		InstanceAge            Duration
+		IMDSVersions           []string
 		Claims                 *Claims
 	}
 	type args struct {
@@ -207,12 +258,16 @@ func TestAWS_Init(t *testing.T) {
 		args    args
 		wantErr bool
 	}{
-		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, nil}, args{config}, false},
-		{"ok", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, nil}, args{config}, false},
-		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, nil}, args{config}, true},
-		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, nil}, args{config}, true},
-		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, nil}, args{config}, true},
-		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, badClaims}, args{config}, true},
+		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, false},
+		{"ok/v1", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1"}, nil}, args{config}, false},
+		{"ok/v2", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v2"}, nil}, args{config}, false},
+		{"ok/empty", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{}, nil}, args{config}, false},
+		{"ok/duration", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, []string{"v1", "v2"}, nil}, args{config}, false},
+		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, true},
+		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, true},
+		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, []string{"v1", "v2"}, nil}, args{config}, true},
+		{"fail/imds", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, nil}, args{config}, true},
+		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, badClaims}, args{config}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -223,6 +278,7 @@ func TestAWS_Init(t *testing.T) {
 				DisableCustomSANs:      tt.fields.DisableCustomSANs,
 				DisableTrustOnFirstUse: tt.fields.DisableTrustOnFirstUse,
 				InstanceAge:            tt.fields.InstanceAge,
+				IMDSVersions:           tt.fields.IMDSVersions,
 				Claims:                 tt.fields.Claims,
 			}
 			if err := p.Init(tt.args.config); (err != nil) != tt.wantErr {
@@ -529,7 +585,7 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 	assert.FatalError(t, err)
 
 	type args struct {
-		token string
+		token, cn string
 	}
 	tests := []struct {
 		name    string
@@ -539,24 +595,24 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 		code    int
 		wantErr bool
 	}{
-		{"ok", p1, args{t1}, 5, http.StatusOK, false},
-		{"ok", p2, args{t2}, 7, http.StatusOK, false},
-		{"ok", p2, args{t2Hostname}, 7, http.StatusOK, false},
-		{"ok", p2, args{t2PrivateIP}, 7, http.StatusOK, false},
-		{"ok", p1, args{t4}, 5, http.StatusOK, false},
-		{"fail account", p3, args{t3}, 0, http.StatusUnauthorized, true},
-		{"fail token", p1, args{"token"}, 0, http.StatusUnauthorized, true},
-		{"fail subject", p1, args{failSubject}, 0, http.StatusUnauthorized, true},
-		{"fail issuer", p1, args{failIssuer}, 0, http.StatusUnauthorized, true},
-		{"fail audience", p1, args{failAudience}, 0, http.StatusUnauthorized, true},
-		{"fail account", p1, args{failAccount}, 0, http.StatusUnauthorized, true},
-		{"fail instanceID", p1, args{failInstanceID}, 0, http.StatusUnauthorized, true},
-		{"fail privateIP", p1, args{failPrivateIP}, 0, http.StatusUnauthorized, true},
-		{"fail region", p1, args{failRegion}, 0, http.StatusUnauthorized, true},
-		{"fail exp", p1, args{failExp}, 0, http.StatusUnauthorized, true},
-		{"fail nbf", p1, args{failNbf}, 0, http.StatusUnauthorized, true},
-		{"fail key", p1, args{failKey}, 0, http.StatusUnauthorized, true},
-		{"fail instance age", p2, args{failInstanceAge}, 0, http.StatusUnauthorized, true},
+		{"ok", p1, args{t1, "foo.local"}, 5, http.StatusOK, false},
+		{"ok", p2, args{t2, "instance-id"}, 9, http.StatusOK, false},
+		{"ok", p2, args{t2Hostname, "ip-127-0-0-1.us-west-1.compute.internal"}, 9, http.StatusOK, false},
+		{"ok", p2, args{t2PrivateIP, "127.0.0.1"}, 9, http.StatusOK, false},
+		{"ok", p1, args{t4, "instance-id"}, 5, http.StatusOK, false},
+		{"fail account", p3, args{token: t3}, 0, http.StatusUnauthorized, true},
+		{"fail token", p1, args{token: "token"}, 0, http.StatusUnauthorized, true},
+		{"fail subject", p1, args{token: failSubject}, 0, http.StatusUnauthorized, true},
+		{"fail issuer", p1, args{token: failIssuer}, 0, http.StatusUnauthorized, true},
+		{"fail audience", p1, args{token: failAudience}, 0, http.StatusUnauthorized, true},
+		{"fail account", p1, args{token: failAccount}, 0, http.StatusUnauthorized, true},
+		{"fail instanceID", p1, args{token: failInstanceID}, 0, http.StatusUnauthorized, true},
+		{"fail privateIP", p1, args{token: failPrivateIP}, 0, http.StatusUnauthorized, true},
+		{"fail region", p1, args{token: failRegion}, 0, http.StatusUnauthorized, true},
+		{"fail exp", p1, args{token: failExp}, 0, http.StatusUnauthorized, true},
+		{"fail nbf", p1, args{token: failNbf}, 0, http.StatusUnauthorized, true},
+		{"fail key", p1, args{token: failKey}, 0, http.StatusUnauthorized, true},
+		{"fail instance age", p2, args{token: failInstanceAge}, 0, http.StatusUnauthorized, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -571,6 +627,33 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 				assert.Equals(t, sc.StatusCode(), tt.code)
 			} else {
 				assert.Len(t, tt.wantLen, got)
+				for _, o := range got {
+					switch v := o.(type) {
+					case *provisionerExtensionOption:
+						assert.Equals(t, v.Type, int(TypeAWS))
+						assert.Equals(t, v.Name, tt.aws.GetName())
+						assert.Equals(t, v.CredentialID, tt.aws.Accounts[0])
+						assert.Len(t, 2, v.KeyValuePairs)
+					case profileDefaultDuration:
+						assert.Equals(t, time.Duration(v), tt.aws.claimer.DefaultTLSCertDuration())
+					case commonNameValidator:
+						assert.Equals(t, string(v), tt.args.cn)
+					case defaultPublicKeyValidator:
+					case *validityValidator:
+						assert.Equals(t, v.min, tt.aws.claimer.MinTLSCertDuration())
+						assert.Equals(t, v.max, tt.aws.claimer.MaxTLSCertDuration())
+					case ipAddressesValidator:
+						assert.Equals(t, []net.IP(v), []net.IP{net.ParseIP("127.0.0.1")})
+					case emailAddressesValidator:
+						assert.Equals(t, v, nil)
+					case urisValidator:
+						assert.Equals(t, v, nil)
+					case dnsNamesValidator:
+						assert.Equals(t, []string(v), []string{"ip-127-0-0-1.us-west-1.compute.internal"})
+					default:
+						assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+					}
+				}
 			}
 		})
 	}

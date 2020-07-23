@@ -398,7 +398,14 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 				{Name: "config.tpl", Type: templates.File, TemplatePath: "./testdata/templates/config.tpl", Path: "ssh/config", Comment: "#"},
 			},
 			Host: []templates.Template{
-				{Name: "sshd_config.tpl", Type: templates.File, TemplatePath: "./testdata/templates/sshd_config.tpl", Path: "/etc/ssh/sshd_config", Comment: "#"},
+				{
+					Name:         "sshd_config.tpl",
+					Type:         templates.File,
+					TemplatePath: "./testdata/templates/sshd_config.tpl",
+					Path:         "/etc/ssh/sshd_config",
+					Comment:      "#",
+					RequiredData: []string{"Certificate", "Key"},
+				},
 			},
 		},
 		Data: map[string]interface{}{
@@ -412,7 +419,7 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 	}
 	userOutputWithUserData := []templates.Output{
 		{Name: "include.tpl", Type: templates.File, Comment: "#", Path: "ssh/include", Content: []byte("Host *\n\tInclude /home/user/.step/ssh/config")},
-		{Name: "config.tpl", Type: templates.File, Comment: "#", Path: "ssh/config", Content: []byte("Match exec \"step ssh check-host %h\"\n\tForwardAgent yes\n\tUserKnownHostsFile /home/user/.step/ssh/known_hosts\n\tProxyCommand step ssh proxycommand %r %h %p\n")},
+		{Name: "config.tpl", Type: templates.File, Comment: "#", Path: "ssh/config", Content: []byte("Match exec \"step ssh check-host %h\"\n\tUserKnownHostsFile /home/user/.step/ssh/known_hosts\n\tProxyCommand step ssh proxycommand %r %h %p\n")},
 	}
 	hostOutputWithUserData := []templates.Output{
 		{Name: "sshd_config.tpl", Type: templates.File, Comment: "#", Path: "/etc/ssh/sshd_config", Content: []byte("TrustedUserCAKeys /etc/ssh/ca.pub\nHostCertificate /etc/ssh/ssh_host_ecdsa_key-cert.pub\nHostKey /etc/ssh/ssh_host_ecdsa_key")},
@@ -425,6 +432,14 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 			},
 			Host: []templates.Template{
 				{Name: "error.tpl", Type: templates.File, TemplatePath: "./testdata/templates/error.tpl", Path: "ssh/error", Comment: "#"},
+			},
+		},
+	}
+
+	tmplConfigFail := &templates.Templates{
+		SSH: &templates.SSHTemplates{
+			User: []templates.Template{
+				{Name: "fail.tpl", Type: templates.File, TemplatePath: "./testdata/templates/fail.tpl", Path: "ssh/fail", Comment: "#"},
 			},
 		},
 	}
@@ -455,11 +470,14 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 		{"badType", fields{tmplConfig, userSigner, hostSigner}, args{"bad", nil}, nil, true},
 		{"userError", fields{tmplConfigErr, userSigner, hostSigner}, args{"user", nil}, nil, true},
 		{"hostError", fields{tmplConfigErr, userSigner, hostSigner}, args{"host", map[string]string{"Function": "foo"}}, nil, true},
+		{"noTemplates", fields{nil, userSigner, hostSigner}, args{"user", nil}, nil, true},
+		{"missingData", fields{tmplConfigWithUserData, userSigner, hostSigner}, args{"host", map[string]string{"Certificate": "ssh_host_ecdsa_key-cert.pub"}}, nil, true},
+		{"failError", fields{tmplConfigFail, userSigner, hostSigner}, args{"user", nil}, nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := testAuthority(t)
-			a.config.Templates = tt.fields.templates
+			a.templates = tt.fields.templates
 			a.sshCAUserCertSignKey = tt.fields.userSigner
 			a.sshCAHostCertSignKey = tt.fields.hostSigner
 
@@ -628,6 +646,7 @@ func TestAuthority_GetSSHBastion(t *testing.T) {
 		wantErr bool
 	}{
 		{"config", fields{&Config{SSH: &SSHConfig{Bastion: bastion}}, nil}, args{"user", "host.local"}, bastion, false},
+		{"bastion", fields{&Config{SSH: &SSHConfig{Bastion: bastion}}, nil}, args{"user", "bastion.local"}, nil, false},
 		{"nil", fields{&Config{SSH: &SSHConfig{Bastion: nil}}, nil}, args{"user", "host.local"}, nil, false},
 		{"empty", fields{&Config{SSH: &SSHConfig{Bastion: &Bastion{}}}, nil}, args{"user", "host.local"}, nil, false},
 		{"func", fields{&Config{}, func(_ context.Context, _, _ string) (*Bastion, error) { return bastion, nil }}, args{"user", "host.local"}, bastion, false},
@@ -913,6 +932,32 @@ func TestAuthority_RekeySSH(t *testing.T) {
 				if assert.Nil(t, tc.err) {
 					tc.cmpResult(tc.cert, cert)
 				}
+			}
+		})
+	}
+}
+
+func TestIsValidForAddUser(t *testing.T) {
+	type args struct {
+		cert *ssh.Certificate
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{"ok", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{"john"}}}, false},
+		{"ok oidc", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{"jane", "jane@smallstep.com"}}}, false},
+		{"fail at", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{"jane", "@smallstep.com"}}}, true},
+		{"fail host", args{&ssh.Certificate{CertType: ssh.HostCert, ValidPrincipals: []string{"john"}}}, true},
+		{"fail principals", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{"john", "jane"}}}, true},
+		{"fail no principals", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{}}}, true},
+		{"fail extra principals", args{&ssh.Certificate{CertType: ssh.UserCert, ValidPrincipals: []string{"john", "jane", "doe"}}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := IsValidForAddUser(tt.args.cert); (err != nil) != tt.wantErr {
+				t.Errorf("IsValidForAddUser() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

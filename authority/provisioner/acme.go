@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"crypto/x509"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/errs"
@@ -15,6 +16,7 @@ type ACME struct {
 	Type    string  `json:"type"`
 	Name    string  `json:"name"`
 	Claims  *Claims `json:"claims,omitempty"`
+	ForceCN bool    `json:"forceCN,omitempty"`
 	claimer *Claimer
 }
 
@@ -43,6 +45,12 @@ func (p *ACME) GetEncryptedKey() (string, string, bool) {
 	return "", "", false
 }
 
+// DefaultTLSCertDuration returns the default TLS cert duration enforced by
+// the provisioner.
+func (p *ACME) DefaultTLSCertDuration() time.Duration {
+	return p.claimer.DefaultTLSCertDuration()
+}
+
 // Init initializes and validates the fields of a JWK type.
 func (p *ACME) Init(config Config) (err error) {
 	switch {
@@ -67,6 +75,7 @@ func (p *ACME) AuthorizeSign(ctx context.Context, token string) ([]SignOption, e
 	return []SignOption{
 		// modifiers / withOptions
 		newProvisionerExtensionOption(TypeACME, p.Name, ""),
+		newForceCNOption(p.ForceCN),
 		profileDefaultDuration(p.claimer.DefaultTLSCertDuration()),
 		// validators
 		defaultPublicKeyValidator{},

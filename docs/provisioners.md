@@ -4,7 +4,110 @@ Provisioners are people or code that are registered with the CA and authorized
 to issue "provisioning tokens". Provisioning tokens are single-use tokens that
 can be used to authenticate with the CA and get a certificate.
 
-## JWK
+See `step ca provisioner add --help` for documentation and examples on adding
+provisioners.
+
+> Attn: We strongly recommend using the `step ca provisioner add ...`
+> utility to generate provisioners in your `ca.json` configuration. We often
+> encode fields differently in the JSON than you might expect. And you can
+> always come in and modify the configuration manually after using the utility.
+
+## Claims
+
+Each provisioner can define an optional `claims` attribute. The settings in this
+attribute override any settings in the global `claims` attribute in the authority
+configuration.
+
+Example `claims`:
+
+```
+    ...
+    "claims": {
+        "minTLSCertDuration": "5m",
+        "maxTLSCertDuration": "24h",
+        "defaultTLSCertDuration": "24h",
+        "disableRenewal": false,
+        "minHostSSHCertDuration": "5m",
+        "maxHostSSHCertDuration": "1680h",
+        "minUserSSHCertDuration": "5m",
+        "maxUserSSHCertDuration": "24h",
+        "maxTLSCertDuration": "16h",
+        "enableSSHCA": true
+    },
+    ...
+```
+
+* `claims` (optional): overwrites the default claims set in the authority.
+  You can set one or more of the following claims:
+
+  * `minTLSCertDuration`: do not allow certificates with a duration less than
+    this value.
+
+  * `maxTLSCertDuration`: do not allow certificates with a duration greater than
+    this value.
+
+  * `defaultTLSCertDuration`: if no certificate validity period is specified,
+    use this value.
+
+  * `disableIssuedAtCheck`: disable a check verifying that provisioning tokens
+    must be issued after the CA has booted. This claim is one prevention against
+    token reuse. The default value is `false`. Do not change this unless you
+    know what you are doing.
+
+  SSH CA properties
+
+  * `minUserSSHCertDuration`: do not allow certificates with a duration less
+  than this value.
+
+  * `maxUserSSHCertDuration`: do not allow certificates with a duration
+  greater than this value.
+
+  * `defaultUserSSHCertDuration`: if no certificate validity period is specified,
+  use this value.
+
+  * `minHostSSHCertDuration`: do not allow certificates with a duration less
+  than this value.
+
+  * `maxHostSSHCertDuration`: do not allow certificates with a duration
+  greater than this value.
+
+  * `defaultHostSSHCertDuration`: if no certificate validity period is specified,
+  use this value.
+
+  * `enableSSHCA`: enable all provisioners to generate SSH Certificates.
+  The deault value is `false`. You can enable this option per provisioner
+  by setting it to `true` in the provisioner claims.
+
+## Provisioner Types
+
+Each provisioner has a different method of authentication with the CA.
+
+  - A JWK provisioner uses a JWT signed by a JWK.
+  - An OIDC provisioner uses a OIDC token signed by an Identity Provider e.g. Google, Okta, Azure.
+  - An AWS provisioner uses an Instance Identity Document signed by AWS.
+  - etc.
+
+### Capabilities by Type
+
+Provisioners are used to authenticate certificate signing requests, and every
+provisioner has a slightly different scope of authorization. Below is a table
+detailing the authorization capabilities of each provisioner.
+
+Provisioner Capabilities| x509-sign | x509-renew | x509-revoke | ssh-user-cert-sign | ssh-host-cert-sign | ssh-user-cert-renew | ssh-host-cert-renew | ssh-revoke | ssh-rekey
+----------- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-:
+JWK    | ✔️  | ✔️  | ✔️  | ✔️  | ✔️  | 𝗫 | 𝗫 | ✔️  | 𝗫
+OIDC   | ✔️  | ✔️  | ✔️  | ✔️  | ✔️ <sup id="a1">[1](#f1)</sup> | 𝗫 | 𝗫 | ✔️  | 𝗫
+X5C    | ✔️  | ✔️  | ✔️  | ✔️  | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫
+K8sSA  | ✔️  | ✔️  | ✔️  | ✔️  | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫
+ACME   | ✔️  | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫 | 𝗫 | 𝗫 | 𝗫
+SSHPOP | 𝗫 | 𝗫 | 𝗫 | 𝗫 | 𝗫 | 𝗫 | ✔️  | ✔️  | ✔️
+AWS    | ✔️  | ✔️  | 𝗫 | 𝗫 | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫
+Azure  | ✔️  | ✔️  | 𝗫 | 𝗫 | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫
+GCP    | ✔️  | ✔️  | 𝗫 | 𝗫 | ✔️  | 𝗫 | 𝗫 | 𝗫 | 𝗫
+
+<b id="f1">1</b> Admin OIDC users can generate Host SSH Certificates. Admins can be configured in the OIDC provisioner. [↩](#a1)
+
+### JWK
 
 JWK is the default provisioner type. It uses public-key cryptography to sign and
 validate a JSON Web Token (JWT).
@@ -34,7 +137,13 @@ In the ca.json configuration file, a complete JWK provisioner example looks like
         "minTLSCertDuration": "5m",
         "maxTLSCertDuration": "24h",
         "defaultTLSCertDuration": "24h",
-        "disableRenewal": false
+        "disableRenewal": false,
+        "minHostSSHCertDuration": "5m",
+        "maxHostSSHCertDuration": "1680h",
+        "minUserSSHCertDuration": "5m",
+        "maxUserSSHCertDuration": "24h",
+        "maxTLSCertDuration": "16h",
+        "enableSSHCA": true
     }
 }
 ```
@@ -75,24 +184,7 @@ In the ca.json configuration file, a complete JWK provisioner example looks like
   provided using the `--key` flag of the `step ca token` to be able to sign the
   token.
 
-* `claims` (optional): overwrites the default claims set in the authority.
-  You can set one or more of the following claims:
-
-  * `minTLSCertDuration`: do not allow certificates with a duration less than
-    this value.
-
-  * `maxTLSCertDuration`: do not allow certificates with a duration greater than
-    this value.
-
-  * `defaultTLSCertDuration`: if no certificate validity period is specified,
-    use this value.
-
-  * `disableIssuedAtCheck`: disable a check verifying that provisioning tokens
-    must be issued after the CA has booted. This claim is one prevention against
-    token reuse. The default value is `false`. Do not change this unless you
-    know what you are doing.
-
-## OIDC
+### OIDC
 
 An OIDC provisioner allows a user to get a certificate after authenticating
 himself with an OAuth OpenID Connect identity provider. The ID token provided
@@ -149,9 +241,173 @@ is G-Suite.
   port to be specified at the time of the request for loopback IP redirect URIs.
 
 * `claims` (optional): overwrites the default claims set in the authority, see
-  the [JWK](#jwk) section for all the options.
+  the [top](#provisioners) section for all the options.
 
-## Provisioners for Cloud Identities
+### X5C
+
+An X5C provisioner allows a client to get an x509 or SSH certificate using
+an existing x509 certificate that is trusted by the X5C provisioner.
+
+An X5C provisioner is configured with a root certificate, supplied by the user,
+at the time the provisioner is created. The X5C provisioner can authenticate
+X5C tokens.
+
+An X5C token is a JWT, signed by the certificate private key, with an `x5c`
+header that contains the chain.
+
+If you would like any certificate signed by `step-ca` to become a provisioner,
+you can configure the X5C provisioner using the root certificate used by
+`step-ca`, like so:
+
+```
+step ca provisioner add x5c-smallstep --type X5C --x5c-root $(step path)/certs/root_ca.crt
+```
+
+Or you can configure the X5C provisioner with an outside root, giving provisioner
+capabilities to a completely separate PKI.
+
+Below is an example of an X5C provisioner in the `ca.json`:
+
+```json
+...
+{
+    "type": "X5C",
+    "name": "x5c",
+    "roots": "LS0tLS1 ... Q0FURS0tLS0tCg==",
+    "claims": {
+        "maxTLSCertDuration": "8h",
+        "defaultTLSCertDuration": "2h",
+        "disableRenewal": true
+    }
+}
+```
+
+* `type` (mandatory): indicates the provisioner type and must be `X5C`.
+
+* `name` (mandatory): a string used to identify the provider when the CLI is
+  used.
+
+* `roots` (mandatory): a base64 encoded list of root certificates used for
+  validating X5C tokens.
+
+* `claims` (optional): overwrites the default claims set in the authority, see
+  the [top](#provisioners) section for all the options.
+
+### SSHPOP
+
+An SSHPOP provisioner allows a client to renew, revoke, or rekey an SSH
+certificate using that certificate for authentication with the CA.
+The renew and rekey methods can only be used on SSH host certificates.
+
+An SSHPOP provisioner is configured with the user and host root ssh certificates
+from the `ca.json`. The SSHPOP provisioner can only authenticate SSHPOP tokens
+generated using SSH certificates created by `step-ca`.
+
+An SSHPOP token is a JWT, signed by the certificate private key, with an `sshpop`
+header that contains the SSH certificate.
+
+Below is an example of an SSHPOP provisioner in the `ca.json`:
+
+```json
+...
+{
+    "type": "SSHPOP",
+    "name": "sshpop-smallstep",
+    "claims": {
+		"enableSSHCA": true
+	}
+}
+```
+
+* `type` (mandatory): indicates the provisioner type and must be `SSHPOP`.
+
+* `name` (mandatory): a string used to identify the provider when the CLI is
+  used.
+
+* `claims` (optional): overwrites the default claims set in the authority, see
+  the [top](#provisioners) section for all the options.
+
+### ACME
+
+An ACME provisioner allows a client to request a certificate from the server
+using the [https://tools.ietf.org/html/rfc8555](ACME Protocol). The ACME
+provisioner can only request X509 certificates. All authentication of the CSR
+is managed by the ACME protocol.
+
+Below is an example of an ACME provisioner in the `ca.json`:
+
+```json
+...
+{
+    "type": "ACME",
+    "name": "my-acme-provisioner",
+    "forceCN": true,
+    "claims": {
+        "maxTLSCertDuration": "8h",
+        "defaultTLSCertDuration": "2h",
+	}
+}
+```
+
+* `type` (mandatory): indicates the provisioner type and must be `ACME`.
+
+* `name` (mandatory): a string used to identify the provider when the CLI is
+  used.
+
+* `forceCN` (optional): force one of the SANs to become the Common Name, if a
+  common name is not provided.
+
+* `claims` (optional): overwrites the default claims set in the authority, see
+  the [top](#provisioners) section for all the options.
+
+See our [`step-ca` ACME tutorial](https://app.smallstep.com/docs/[product]/tutorials/acme-provisioners)
+for more guidance on configuring and using the ACME protocol with `step-ca`.
+
+### K8sSA - Kubernetes Service Account
+
+A K8sSA provisioner allows a client to request a certificate from the server
+using a Kubernetes Service Account Token.
+
+As of the time when this provisioner was coded, the Kubernetes Service Account
+API for retrieving the token from a running instance was still in beta. Therefore,
+our K8sSA provisioner must be configured with the public key that will be used
+to validate K8sSA tokens.
+
+K8sSA tokens are very minimal. There is no place for SANs, or other details that
+a user may want validated in a CSR. It is essentially a bearer token. Therefore,
+at this time a K8sSA token can be used to sign a CSR with any SANs. Said
+differently, the **K8sSA provisioner does little to no validation on the CSR
+before signing it**. You should only configure and use this provisioner if you
+know what you are doing. If a malicious user obtains the private key they will
+be able to create certificates with any SANs and Subject.
+
+Below is an example of a K8sSA provisioner in the `ca.json`:
+
+```json
+...
+{
+    "type": "K8sSA",
+    "name": "my-kube-provisioner",
+    "publicKeys": "LS0tLS1...LS0tCg==",
+    "claims": {
+        "maxTLSCertDuration": "8h",
+        "defaultTLSCertDuration": "2h",
+    }
+}
+```
+
+* `type` (mandatory): indicates the provisioner type and must be `K8sSA`.
+
+* `name` (mandatory): a string used to identify the provider when the CLI is
+  used.
+
+* `publicKeys` (mandatory): a base64 encoded list of public keys used to validate
+  K8sSA tokens.
+
+* `claims` (optional): overwrites the default claims set in the authority, see
+  the [top](#provisioners) section for all the options.
+
+### Provisioners for Cloud Identities
 
 [Step certificates](https://github.com/smallstep/certificates) can grant
 certificates to code running in a machine without any other authentication than
@@ -166,7 +422,7 @@ you can only grant a certificate once. After this first grant, the same machine
 will need to renew the certificate using mTLS, and the CA will block any other
 attempt to grant a certificate to that instance.
 
-### AWS
+#### AWS
 
 The AWS provisioner allows granting a certificate to an Amazon EC2 instance
 using the [Instance Identity Documents](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html)
@@ -213,9 +469,9 @@ In the ca.json, an AWS provisioner looks like:
   certificate. The instance age is a string using the duration format.
 
 * `claims` (optional): overwrites the default claims set in the authority, see
-  the [JWK](#jwk) section for all the options.
+  the [top](#provisioners) section for all the options.
 
-### GCP
+#### GCP
 
 The GCP provisioner grants certificates to Google Compute Engine instance using
 its [identity](https://cloud.google.com/compute/docs/instances/verifying-instance-identity)
@@ -265,9 +521,9 @@ In the ca.json, a GCP provisioner looks like:
   certificate. The instance age is a string using the duration format.
 
 * `claims` (optional): overwrites the default claims set in the authority, see
-  the [JWK](#jwk) section for all the options.
+  the [top](#provisioners) section for all the options.
 
-### Azure
+#### Azure
 
 The Azure provisioner grants certificates to Microsoft Azure instances using
 the [managed identities tokens](https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/how-to-use-vm-token).
@@ -315,4 +571,4 @@ In the ca.json, an Azure provisioner looks like:
   and different tokens can be used to get different certificates.
 
 * `claims` (optional): overwrites the default claims set in the authority, see
-  the [JWK](#jwk) section for all the options.
+  the [top](#provisioners) section for all the options.

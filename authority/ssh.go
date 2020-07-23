@@ -125,15 +125,19 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 		return nil, errs.NotFound("getSSHConfig: ssh is not configured")
 	}
 
+	if a.templates == nil {
+		return nil, errs.NotFound("getSSHConfig: ssh templates are not configured")
+	}
+
 	var ts []templates.Template
 	switch typ {
 	case provisioner.SSHUserCert:
-		if a.config.Templates != nil && a.config.Templates.SSH != nil {
-			ts = a.config.Templates.SSH.User
+		if a.templates != nil && a.templates.SSH != nil {
+			ts = a.templates.SSH.User
 		}
 	case provisioner.SSHHostCert:
-		if a.config.Templates != nil && a.config.Templates.SSH != nil {
-			ts = a.config.Templates.SSH.Host
+		if a.templates != nil && a.templates.SSH != nil {
+			ts = a.templates.SSH.Host
 		}
 	default:
 		return nil, errs.BadRequest("getSSHConfig: type %s is not valid", typ)
@@ -143,11 +147,11 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 	var mergedData map[string]interface{}
 
 	if len(data) == 0 {
-		mergedData = a.config.Templates.Data
+		mergedData = a.templates.Data
 	} else {
-		mergedData = make(map[string]interface{}, len(a.config.Templates.Data)+1)
+		mergedData = make(map[string]interface{}, len(a.templates.Data)+1)
 		mergedData["User"] = data
-		for k, v := range a.config.Templates.Data {
+		for k, v := range a.templates.Data {
 			mergedData[k] = v
 		}
 	}
@@ -155,6 +159,15 @@ func (a *Authority) GetSSHConfig(ctx context.Context, typ string, data map[strin
 	// Render templates
 	output := []templates.Output{}
 	for _, t := range ts {
+		if err := t.Load(); err != nil {
+			return nil, err
+		}
+
+		// Check for required variables.
+		if err := t.ValidateRequiredData(data); err != nil {
+			return nil, errs.BadRequestErr(err, errs.WithMessage("%v, please use `--set <key=value>` flag", err))
+		}
+
 		o, err := t.Output(mergedData)
 		if err != nil {
 			return nil, err
@@ -173,7 +186,17 @@ func (a *Authority) GetSSHBastion(ctx context.Context, user string, hostname str
 	}
 	if a.config.SSH != nil {
 		if a.config.SSH.Bastion != nil && a.config.SSH.Bastion.Hostname != "" {
-			return a.config.SSH.Bastion, nil
+			// Do not return a bastion for a bastion host.
+			//
+			// This condition might fail if a different name or IP is used.
+			// Trying to resolve hostnames to IPs and compare them won't be a
+			// complete solution because it depends on the network
+			// configuration, of the CA and clients and can also return false
+			// positives. Although not perfect, this simple solution will work
+			// in most cases.
+			if !strings.EqualFold(hostname, a.config.SSH.Bastion.Hostname) {
+				return a.config.SSH.Bastion, nil
+			}
 		}
 		return nil, nil
 	}
@@ -442,16 +465,37 @@ func (a *Authority) RekeySSH(ctx context.Context, oldCert *ssh.Certificate, pub 
 	return cert, nil
 }
 
+// IsValidForAddUser checks if a user provisioner certificate can be issued to
+// the given certificate.
+func IsValidForAddUser(cert *ssh.Certificate) error {
+	if cert.CertType != ssh.UserCert {
+		return errors.New("certificate is not a user certificate")
+	}
+
+	switch len(cert.ValidPrincipals) {
+	case 0:
+		return errors.New("certificate does not have any principals")
+	case 1:
+		return nil
+	case 2:
+		// OIDC provisioners adds a second principal with the email address.
+		// @ cannot be the first character.
+		if strings.Index(cert.ValidPrincipals[1], "@") > 0 {
+			return nil
+		}
+		return errors.New("certificate does not have only one principal")
+	default:
+		return errors.New("certificate does not have only one principal")
+	}
+}
+
 // SignSSHAddUser signs a certificate that provisions a new user in a server.
 func (a *Authority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, subject *ssh.Certificate) (*ssh.Certificate, error) {
 	if a.sshCAUserCertSignKey == nil {
 		return nil, errs.NotImplemented("signSSHAddUser: user certificate signing is not enabled")
 	}
-	if subject.CertType != ssh.UserCert {
-		return nil, errs.Forbidden("signSSHAddUser: certificate is not a user certificate")
-	}
-	if len(subject.ValidPrincipals) != 1 {
-		return nil, errs.Forbidden("signSSHAddUser: certificate does not have only one principal")
+	if err := IsValidForAddUser(subject); err != nil {
+		return nil, errs.Wrap(http.StatusForbidden, err, "signSSHAddUser")
 	}
 
 	nonce, err := randutil.ASCII(32)

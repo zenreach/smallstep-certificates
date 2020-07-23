@@ -45,10 +45,12 @@ func (o *Order) GetID() string {
 
 // OrderOptions options with which to create a new Order.
 type OrderOptions struct {
-	AccountID   string       `json:"accID"`
-	Identifiers []Identifier `json:"identifiers"`
-	NotBefore   time.Time    `json:"notBefore"`
-	NotAfter    time.Time    `json:"notAfter"`
+	AccountID       string       `json:"accID"`
+	Identifiers     []Identifier `json:"identifiers"`
+	NotBefore       time.Time    `json:"notBefore"`
+	NotAfter        time.Time    `json:"notAfter"`
+	backdate        time.Duration
+	defaultDuration time.Duration
 }
 
 type order struct {
@@ -82,6 +84,17 @@ func newOrder(db nosql.DB, ops OrderOptions) (*order, error) {
 	}
 
 	now := clock.Now()
+	var backdate time.Duration
+	nbf := ops.NotBefore
+	if nbf.IsZero() {
+		nbf = now
+		backdate = -1 * ops.backdate
+	}
+	naf := ops.NotAfter
+	if naf.IsZero() {
+		naf = nbf.Add(ops.defaultDuration)
+	}
+
 	o := &order{
 		ID:             id,
 		AccountID:      ops.AccountID,
@@ -89,8 +102,8 @@ func newOrder(db nosql.DB, ops OrderOptions) (*order, error) {
 		Status:         StatusPending,
 		Expires:        now.Add(defaultOrderExpiry),
 		Identifiers:    ops.Identifiers,
-		NotBefore:      ops.NotBefore,
-		NotAfter:       ops.NotAfter,
+		NotBefore:      nbf.Add(backdate),
+		NotAfter:       naf,
 		Authorizations: authzs,
 	}
 	if err := o.save(db, nil); err != nil {
@@ -112,10 +125,17 @@ func newOrder(db nosql.DB, ops OrderOptions) (*order, error) {
 
 type orderIDs []string
 
+// save is used to update the list of orderIDs keyed by ACME account ID
+// stored in the database.
+//
+// This method always converts empty lists to 'nil' when storing to the DB. We
+// do this to avoid any confusion between an empty list and a nil value in the
+// db.
 func (oids orderIDs) save(db nosql.DB, old orderIDs, accID string) error {
 	var (
 		err  error
 		oldb []byte
+		newb []byte
 	)
 	if len(old) == 0 {
 		oldb = nil
@@ -125,9 +145,13 @@ func (oids orderIDs) save(db nosql.DB, old orderIDs, accID string) error {
 			return ServerInternalErr(errors.Wrap(err, "error marshaling old order IDs slice"))
 		}
 	}
-	newb, err := json.Marshal(oids)
-	if err != nil {
-		return ServerInternalErr(errors.Wrap(err, "error marshaling new order IDs slice"))
+	if len(oids) == 0 {
+		newb = nil
+	} else {
+		newb, err = json.Marshal(oids)
+		if err != nil {
+			return ServerInternalErr(errors.Wrap(err, "error marshaling new order IDs slice"))
+		}
 	}
 	_, swapped, err := db.CmpAndSwap(ordersByAccountIDTable, []byte(accID), oldb, newb)
 	switch {
@@ -217,10 +241,15 @@ func (o *order) updateStatus(db nosql.DB) (*order, error) {
 		switch {
 		case count[StatusInvalid] > 0:
 			newOrder.Status = StatusInvalid
+
+		// No change in the order status, so just return the order as is -
+		// without writing any changes.
 		case count[StatusPending] > 0:
-			break
+			return newOrder, nil
+
 		case count[StatusValid] == len(o.Authorizations):
 			newOrder.Status = StatusReady
+
 		default:
 			return nil, ServerInternalErr(errors.New("unexpected authz status"))
 		}
@@ -236,7 +265,7 @@ func (o *order) updateStatus(db nosql.DB) (*order, error) {
 
 // finalize signs a certificate if the necessary conditions for Order completion
 // have been met.
-func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAuthority, p provisioner.Interface) (*order, error) {
+func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAuthority, p Provisioner) (*order, error) {
 	var err error
 	if o, err = o.updateStatus(db); err != nil {
 		return nil, err
@@ -277,6 +306,16 @@ func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAut
 		if csr.DNSNames[i] != orderNames[i] {
 			return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
 		}
+	}
+
+	if len(csr.IPAddresses) > 0 {
+		return nil, BadCSRErr(errors.Errorf("CSR contains IP Address SANs, but should only contain DNS Names"))
+	}
+	if len(csr.EmailAddresses) > 0 {
+		return nil, BadCSRErr(errors.Errorf("CSR contains Email Address SANs, but should only contain DNS Names"))
+	}
+	if len(csr.URIs) > 0 {
+		return nil, BadCSRErr(errors.Errorf("CSR contains URI SANs, but should only contain DNS Names"))
 	}
 
 	// Get authorizations from the ACME provisioner.
@@ -332,10 +371,10 @@ func getOrder(db nosql.DB, id string) (*order, error) {
 
 // toACME converts the internal Order type into the public acmeOrder type for
 // presentation in the ACME protocol.
-func (o *order) toACME(db nosql.DB, dir *directory, p provisioner.Interface) (*Order, error) {
+func (o *order) toACME(ctx context.Context, db nosql.DB, dir *directory) (*Order, error) {
 	azs := make([]string, len(o.Authorizations))
 	for i, aid := range o.Authorizations {
-		azs[i] = dir.getLink(AuthzLink, URLSafeProvisionerName(p), true, aid)
+		azs[i] = dir.getLink(ctx, AuthzLink, true, aid)
 	}
 	ao := &Order{
 		Status:         o.Status,
@@ -344,12 +383,12 @@ func (o *order) toACME(db nosql.DB, dir *directory, p provisioner.Interface) (*O
 		NotBefore:      o.NotBefore.Format(time.RFC3339),
 		NotAfter:       o.NotAfter.Format(time.RFC3339),
 		Authorizations: azs,
-		Finalize:       dir.getLink(FinalizeLink, URLSafeProvisionerName(p), true, o.ID),
+		Finalize:       dir.getLink(ctx, FinalizeLink, true, o.ID),
 		ID:             o.ID,
 	}
 
 	if o.Certificate != "" {
-		ao.Certificate = dir.getLink(CertificateLink, URLSafeProvisionerName(p), true, o.Certificate)
+		ao.Certificate = dir.getLink(ctx, CertificateLink, true, o.Certificate)
 	}
 	return ao, nil
 }

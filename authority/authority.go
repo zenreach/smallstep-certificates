@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"log"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ type Authority struct {
 	keyManager   kms.KeyManager
 	provisioners *provisioner.Collection
 	db           db.AuthDB
+	templates    *templates.Templates
 
 	// X509 CA
 	rootX509Certs      []*x509.Certificate
@@ -67,7 +69,6 @@ func New(config *Config, opts ...Option) (*Authority, error) {
 	var a = &Authority{
 		config:       config,
 		certificates: new(sync.Map),
-		provisioners: provisioner.NewCollection(config.getAudiences()),
 	}
 
 	// Apply options.
@@ -76,6 +77,44 @@ func New(config *Config, opts ...Option) (*Authority, error) {
 			return nil, err
 		}
 	}
+
+	// Initialize authority from options or configuration.
+	if err := a.init(); err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+// NewEmbedded initializes an authority that can be embedded in a different
+// project without the limitations of the config.
+func NewEmbedded(opts ...Option) (*Authority, error) {
+	a := &Authority{
+		config:       &Config{},
+		certificates: new(sync.Map),
+	}
+
+	// Apply options.
+	for _, fn := range opts {
+		if err := fn(a); err != nil {
+			return nil, err
+		}
+	}
+
+	// Validate required options
+	switch {
+	case a.config == nil:
+		return nil, errors.New("cannot create an authority without a configuration")
+	case len(a.rootX509Certs) == 0 && a.config.Root.HasEmpties():
+		return nil, errors.New("cannot create an authority without a root certificate")
+	case a.x509Issuer == nil && a.config.IntermediateCert == "":
+		return nil, errors.New("cannot create an authority without an issuer certificate")
+	case a.x509Signer == nil && a.config.IntermediateKey == "":
+		return nil, errors.New("cannot create an authority without an issuer signer")
+	}
+
+	// Initialize config required fields.
+	a.config.init()
 
 	// Initialize authority from options or configuration.
 	if err := a.init(); err != nil {
@@ -164,6 +203,7 @@ func (a *Authority) init() error {
 	}
 
 	// Decrypt and load SSH keys
+	var tmplVars templates.Step
 	if a.config.SSH != nil {
 		if a.config.SSH.HostKey != "" {
 			signer, err := a.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
@@ -217,6 +257,14 @@ func (a *Authority) init() error {
 				return errors.Errorf("unsupported type %s", key.Type)
 			}
 		}
+
+		// Configure template variables.
+		tmplVars.SSH.HostKey = a.sshCAHostCertSignKey.PublicKey()
+		tmplVars.SSH.UserKey = a.sshCAUserCertSignKey.PublicKey()
+		// On the templates we skip the first one because there's a distinction
+		// between the main key and federated keys.
+		tmplVars.SSH.HostFederatedKeys = append(tmplVars.SSH.HostFederatedKeys, a.sshCAHostFederatedCerts[1:]...)
+		tmplVars.SSH.UserFederatedKeys = append(tmplVars.SSH.UserFederatedKeys, a.sshCAUserFederatedCerts[1:]...)
 	}
 
 	// Merge global and configuration claims
@@ -232,9 +280,11 @@ func (a *Authority) init() error {
 		return err
 	}
 	// Initialize provisioners
+	audiences := a.config.getAudiences()
+	a.provisioners = provisioner.NewCollection(audiences)
 	config := provisioner.Config{
 		Claims:    claimer.Claims(),
-		Audiences: a.config.getAudiences(),
+		Audiences: audiences,
 		DB:        a.db,
 		SSHKeys: &provisioner.SSHKeys{
 			UserKeys: sshKeys.UserKeys,
@@ -252,23 +302,16 @@ func (a *Authority) init() error {
 		}
 	}
 
-	// Configure protected template variables:
-	if t := a.config.Templates; t != nil {
-		if t.Data == nil {
-			t.Data = make(map[string]interface{})
+	// Configure templates, currently only ssh templates are supported.
+	if a.sshCAHostCertSignKey != nil || a.sshCAUserCertSignKey != nil {
+		a.templates = a.config.Templates
+		if a.templates == nil {
+			a.templates = templates.DefaultTemplates()
 		}
-		var vars templates.Step
-		if a.config.SSH != nil {
-			if a.sshCAHostCertSignKey != nil {
-				vars.SSH.HostKey = a.sshCAHostCertSignKey.PublicKey()
-				vars.SSH.HostFederatedKeys = append(vars.SSH.HostFederatedKeys, a.sshCAHostFederatedCerts[1:]...)
-			}
-			if a.sshCAUserCertSignKey != nil {
-				vars.SSH.UserKey = a.sshCAUserCertSignKey.PublicKey()
-				vars.SSH.UserFederatedKeys = append(vars.SSH.UserFederatedKeys, a.sshCAUserFederatedCerts[1:]...)
-			}
+		if a.templates.Data == nil {
+			a.templates.Data = make(map[string]interface{})
 		}
-		t.Data["Step"] = vars
+		a.templates.Data["Step"] = tmplVars
 	}
 
 	// JWT numeric dates are seconds.
@@ -288,5 +331,8 @@ func (a *Authority) GetDatabase() db.AuthDB {
 
 // Shutdown safely shuts down any clients, databases, etc. held by the Authority.
 func (a *Authority) Shutdown() error {
+	if err := a.keyManager.Close(); err != nil {
+		log.Printf("error closing the key manager: %v", err)
+	}
 	return a.db.Shutdown()
 }

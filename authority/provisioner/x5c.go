@@ -9,7 +9,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/jose"
 )
 
@@ -194,18 +193,15 @@ func (p *X5C) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 		claims.SANs = []string{claims.Subject}
 	}
 
-	dnsNames, ips, emails := x509util.SplitSANs(claims.SANs)
-
 	return []SignOption{
 		// modifiers / withOptions
 		newProvisionerExtensionOption(TypeX5C, p.Name, ""),
-		profileLimitDuration{p.claimer.DefaultTLSCertDuration(), claims.chains[0][0].NotAfter},
+		profileLimitDuration{p.claimer.DefaultTLSCertDuration(),
+			claims.chains[0][0].NotBefore, claims.chains[0][0].NotAfter},
 		// validators
 		commonNameValidator(claims.Subject),
+		defaultSANsValidator(claims.SANs),
 		defaultPublicKeyValidator{},
-		dnsNamesValidator(dnsNames),
-		emailAddressesValidator(emails),
-		ipAddressesValidator(ips),
 		newValidityValidator(p.claimer.MinTLSCertDuration(), p.claimer.MaxTLSCertDuration()),
 	}, nil
 }

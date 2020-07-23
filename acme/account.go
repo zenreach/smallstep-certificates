@@ -1,11 +1,11 @@
 package acme
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/nosql"
 )
@@ -79,11 +79,11 @@ func newAccount(db nosql.DB, ops AccountOptions) (*account, error) {
 
 // toACME converts the internal Account type into the public acmeAccount
 // type for presentation in the ACME protocol.
-func (a *account) toACME(db nosql.DB, dir *directory, p provisioner.Interface) (*Account, error) {
+func (a *account) toACME(ctx context.Context, db nosql.DB, dir *directory) (*Account, error) {
 	return &Account{
 		Status:  a.Status,
 		Contact: a.Contact,
-		Orders:  dir.getLink(OrdersByAccountLink, URLSafeProvisionerName(p), true, a.ID),
+		Orders:  dir.getLink(ctx, OrdersByAccountLink, true, a.ID),
 		Key:     a.Key,
 		ID:      a.ID,
 	}, nil
@@ -198,17 +198,46 @@ func getAccountByKeyID(db nosql.DB, kid string) (*account, error) {
 
 // getOrderIDsByAccount retrieves a list of Order IDs that were created by the
 // account.
-func getOrderIDsByAccount(db nosql.DB, id string) ([]string, error) {
-	b, err := db.Get(ordersByAccountIDTable, []byte(id))
+func getOrderIDsByAccount(db nosql.DB, accID string) ([]string, error) {
+	b, err := db.Get(ordersByAccountIDTable, []byte(accID))
 	if err != nil {
 		if nosql.IsErrNotFound(err) {
 			return []string{}, nil
 		}
-		return nil, ServerInternalErr(errors.Wrapf(err, "error loading orderIDs for account %s", id))
+		return nil, ServerInternalErr(errors.Wrapf(err, "error loading orderIDs for account %s", accID))
 	}
-	var orderIDs []string
-	if err := json.Unmarshal(b, &orderIDs); err != nil {
-		return nil, ServerInternalErr(errors.Wrapf(err, "error unmarshaling orderIDs for account %s", id))
+	var oids []string
+	if err := json.Unmarshal(b, &oids); err != nil {
+		return nil, ServerInternalErr(errors.Wrapf(err, "error unmarshaling orderIDs for account %s", accID))
 	}
-	return orderIDs, nil
+
+	// Remove any order that is not in PENDING state and update the stored list
+	// before returning.
+	//
+	// According to RFC 8555:
+	// The server SHOULD include pending orders and SHOULD NOT include orders
+	// that are invalid in the array of URLs.
+	pendOids := []string{}
+	for _, oid := range oids {
+		o, err := getOrder(db, oid)
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error loading order %s for account %s", oid, accID))
+		}
+		if o, err = o.updateStatus(db); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error updating order %s for account %s", oid, accID))
+		}
+		if o.Status == StatusPending {
+			pendOids = append(pendOids, oid)
+		}
+	}
+	// If the number of pending orders is less than the number of orders in the
+	// list, then update the pending order list.
+	if len(pendOids) != len(oids) {
+		if err = orderIDs(pendOids).save(db, oids, accID); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error storing orderIDs as part of getOrderIDsByAccount logic: "+
+				"len(orderIDs) = %d", len(pendOids)))
+		}
+	}
+
+	return pendOids, nil
 }

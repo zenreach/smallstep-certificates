@@ -6,6 +6,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 
@@ -37,17 +39,13 @@ func newO() (*order, error) {
 			return []byte("foo"), true, nil
 		},
 		MGet: func(bucket, key []byte) ([]byte, error) {
-			b, err := json.Marshal([]string{"1", "2"})
-			if err != nil {
-				return nil, err
-			}
-			return b, nil
+			return nil, database.ErrNotFound
 		},
 	}
 	return newOrder(mockdb, defaultOrderOps())
 }
 
-func TestGetOrder(t *testing.T) {
+func Test_getOrder(t *testing.T) {
 	type test struct {
 		id  string
 		db  nosql.DB
@@ -150,6 +148,10 @@ func TestGetOrder(t *testing.T) {
 func TestOrderToACME(t *testing.T) {
 	dir := newDirectory("ca.smallstep.com", "acme")
 	prov := newProv()
+	provName := url.PathEscape(prov.GetName())
+	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, baseURL)
 
 	type test struct {
 		o   *order
@@ -172,7 +174,7 @@ func TestOrderToACME(t *testing.T) {
 	for name, run := range tests {
 		tc := run(t)
 		t.Run(name, func(t *testing.T) {
-			acmeOrder, err := tc.o.toACME(nil, dir, prov)
+			acmeOrder, err := tc.o.toACME(ctx, nil, dir)
 			if err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
@@ -186,9 +188,10 @@ func TestOrderToACME(t *testing.T) {
 					assert.Equals(t, acmeOrder.ID, tc.o.ID)
 					assert.Equals(t, acmeOrder.Status, tc.o.Status)
 					assert.Equals(t, acmeOrder.Identifiers, tc.o.Identifiers)
-					assert.Equals(t, acmeOrder.Finalize, fmt.Sprintf("https://ca.smallstep.com/acme/%s/order/%s/finalize", URLSafeProvisionerName(prov), tc.o.ID))
+					assert.Equals(t, acmeOrder.Finalize,
+						fmt.Sprintf("%s/acme/%s/order/%s/finalize", baseURL.String(), provName, tc.o.ID))
 					if tc.o.Certificate != "" {
-						assert.Equals(t, acmeOrder.Certificate, fmt.Sprintf("https://ca.smallstep.com/acme/%s/certificate/%s", URLSafeProvisionerName(prov), tc.o.Certificate))
+						assert.Equals(t, acmeOrder.Certificate, fmt.Sprintf("%s/acme/%s/certificate/%s", baseURL.String(), provName, tc.o.Certificate))
 					}
 
 					expiry, err := time.Parse(time.RFC3339, acmeOrder.Expires)
@@ -303,7 +306,7 @@ func TestOrderSave(t *testing.T) {
 	}
 }
 
-func TestNewOrder(t *testing.T) {
+func Test_newOrder(t *testing.T) {
 	type test struct {
 		ops    OrderOptions
 		db     nosql.DB
@@ -357,9 +360,6 @@ func TestNewOrder(t *testing.T) {
 		},
 		"fail/save-orderIDs-error": func(t *testing.T) test {
 			count := 0
-			oids := []string{"1", "2", "3"}
-			oidsB, err := json.Marshal(oids)
-			assert.FatalError(t, err)
 			var (
 				_oid = ""
 				oid  = &_oid
@@ -380,7 +380,7 @@ func TestNewOrder(t *testing.T) {
 						return nil, true, nil
 					},
 					MGet: func(bucket, key []byte) ([]byte, error) {
-						return oidsB, nil
+						return nil, database.ErrNotFound
 					},
 					MDel: func(bucket, key []byte) error {
 						assert.Equals(t, bucket, orderTable)
@@ -393,9 +393,6 @@ func TestNewOrder(t *testing.T) {
 		},
 		"ok": func(t *testing.T) test {
 			count := 0
-			oids := []string{"1", "2", "3"}
-			oidsB, err := json.Marshal(oids)
-			assert.FatalError(t, err)
 			authzs := &([]string{})
 			var (
 				_oid = ""
@@ -409,8 +406,8 @@ func TestNewOrder(t *testing.T) {
 						if count >= 9 {
 							assert.Equals(t, bucket, ordersByAccountIDTable)
 							assert.Equals(t, key, []byte(ops.AccountID))
-							assert.Equals(t, old, oidsB)
-							newB, err := json.Marshal(append(oids, *oid))
+							assert.Equals(t, old, nil)
+							newB, err := json.Marshal([]string{*oid})
 							assert.FatalError(t, err)
 							assert.Equals(t, newval, newB)
 						} else if count == 8 {
@@ -424,7 +421,47 @@ func TestNewOrder(t *testing.T) {
 						return nil, true, nil
 					},
 					MGet: func(bucket, key []byte) ([]byte, error) {
-						return oidsB, nil
+						return nil, database.ErrNotFound
+					},
+				},
+				authzs: authzs,
+			}
+		},
+		"ok/validity-bounds-not-set": func(t *testing.T) test {
+			count := 0
+			authzs := &([]string{})
+			var (
+				_oid = ""
+				oid  = &_oid
+			)
+			ops := defaultOrderOps()
+			ops.backdate = time.Minute
+			ops.defaultDuration = 12 * time.Hour
+			ops.NotBefore = time.Time{}
+			ops.NotAfter = time.Time{}
+			return test{
+				ops: ops,
+				db: &db.MockNoSQLDB{
+					MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
+						if count >= 9 {
+							assert.Equals(t, bucket, ordersByAccountIDTable)
+							assert.Equals(t, key, []byte(ops.AccountID))
+							assert.Equals(t, old, nil)
+							newB, err := json.Marshal([]string{*oid})
+							assert.FatalError(t, err)
+							assert.Equals(t, newval, newB)
+						} else if count == 8 {
+							*oid = string(key)
+						} else if count == 7 {
+							*authzs = append(*authzs, string(key))
+						} else if count == 3 {
+							*authzs = []string{string(key)}
+						}
+						count++
+						return nil, true, nil
+					},
+					MGet: func(bucket, key []byte) ([]byte, error) {
+						return nil, database.ErrNotFound
 					},
 				},
 				authzs: authzs,
@@ -459,15 +496,28 @@ func TestNewOrder(t *testing.T) {
 					assert.True(t, o.Expires.Before(expiry.Add(time.Minute)))
 					assert.True(t, o.Expires.After(expiry.Add(-1*time.Minute)))
 
-					assert.Equals(t, o.NotBefore, tc.ops.NotBefore)
-					assert.Equals(t, o.NotAfter, tc.ops.NotAfter)
+					nbf := tc.ops.NotBefore
+					now := time.Now().UTC()
+					if !tc.ops.NotBefore.IsZero() {
+						assert.Equals(t, o.NotBefore, tc.ops.NotBefore)
+					} else {
+						nbf = o.NotBefore.Add(tc.ops.backdate)
+						assert.True(t, o.NotBefore.Before(now.Add(-tc.ops.backdate+time.Second)))
+						assert.True(t, o.NotBefore.Add(tc.ops.backdate+2*time.Second).After(now))
+					}
+					if !tc.ops.NotAfter.IsZero() {
+						assert.Equals(t, o.NotAfter, tc.ops.NotAfter)
+					} else {
+						naf := nbf.Add(tc.ops.defaultDuration)
+						assert.Equals(t, o.NotAfter, naf)
+					}
 				}
 			}
 		})
 	}
 }
 
-func TestOrderIDsSave(t *testing.T) {
+func TestOrderIDs_save(t *testing.T) {
 	accID := "acc-id"
 	newOids := func() orderIDs {
 		return []string{"1", "2"}
@@ -535,6 +585,26 @@ func TestOrderIDsSave(t *testing.T) {
 					MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 						assert.Equals(t, old, oldb)
 						assert.Equals(t, newval, b)
+						assert.Equals(t, bucket, ordersByAccountIDTable)
+						assert.Equals(t, key, []byte(accID))
+						return nil, true, nil
+					},
+				},
+			}
+		},
+		"ok/new-empty-saved-as-nil": func(t *testing.T) test {
+			oldOids := newOids()
+			oids := []string{}
+
+			oldb, err := json.Marshal(oldOids)
+			assert.FatalError(t, err)
+			return test{
+				oids: oids,
+				old:  oldOids,
+				db: &db.MockNoSQLDB{
+					MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
+						assert.Equals(t, old, oldb)
+						assert.Equals(t, newval, nil)
 						assert.Equals(t, bucket, ordersByAccountIDTable)
 						assert.Equals(t, key, []byte(accID))
 						return nil, true, nil
@@ -855,7 +925,7 @@ func TestOrderFinalize(t *testing.T) {
 		db     nosql.DB
 		csr    *x509.CertificateRequest
 		sa     SignAuthority
-		prov   provisioner.Interface
+		prov   Provisioner
 	}
 	tests := map[string]func(t *testing.T) test{
 		"fail/already-invalid": func(t *testing.T) test {
@@ -987,6 +1057,62 @@ func TestOrderFinalize(t *testing.T) {
 				err: BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly")),
 			}
 		},
+		"fail/ready/no-ipAddresses": func(t *testing.T) test {
+			o, err := newO()
+			assert.FatalError(t, err)
+			o.Status = StatusReady
+
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "",
+				},
+				DNSNames:    []string{"acme.example.com", "step.example.com"},
+				IPAddresses: []net.IP{net.ParseIP("1.1.1.1")},
+			}
+			return test{
+				o:   o,
+				csr: csr,
+				err: BadCSRErr(errors.Errorf("CSR contains IP Address SANs, but should only contain DNS Names")),
+			}
+		},
+		"fail/ready/no-emailAddresses": func(t *testing.T) test {
+			o, err := newO()
+			assert.FatalError(t, err)
+			o.Status = StatusReady
+
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "",
+				},
+				DNSNames:       []string{"acme.example.com", "step.example.com"},
+				EmailAddresses: []string{"max@smallstep.com", "mariano@smallstep.com"},
+			}
+			return test{
+				o:   o,
+				csr: csr,
+				err: BadCSRErr(errors.Errorf("CSR contains Email Address SANs, but should only contain DNS Names")),
+			}
+		},
+		"fail/ready/no-URIs": func(t *testing.T) test {
+			o, err := newO()
+			assert.FatalError(t, err)
+			o.Status = StatusReady
+
+			u, err := url.Parse("https://google.com")
+			assert.FatalError(t, err)
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "",
+				},
+				DNSNames: []string{"acme.example.com", "step.example.com"},
+				URIs:     []*url.URL{u},
+			}
+			return test{
+				o:   o,
+				csr: csr,
+				err: BadCSRErr(errors.Errorf("CSR contains URI SANs, but should only contain DNS Names")),
+			}
+		},
 		"fail/ready/provisioner-auth-sign-error": func(t *testing.T) test {
 			o, err := newO()
 			assert.FatalError(t, err)
@@ -1002,7 +1128,7 @@ func TestOrderFinalize(t *testing.T) {
 				o:   o,
 				csr: csr,
 				err: ServerInternalErr(errors.New("error retrieving authorization options from ACME provisioner: force")),
-				prov: &provisioner.MockProvisioner{
+				prov: &MockProvisioner{
 					MauthorizeSign: func(ctx context.Context, token string) ([]provisioner.SignOption, error) {
 						return nil, errors.New("force")
 					},
@@ -1137,7 +1263,7 @@ func TestOrderFinalize(t *testing.T) {
 				csr: csr,
 				sa: &mockSignAuth{
 					sign: func(csr *x509.CertificateRequest, pops provisioner.Options, signOps ...provisioner.SignOption) ([]*x509.Certificate, error) {
-						assert.Equals(t, len(signOps), 4)
+						assert.Equals(t, len(signOps), 5)
 						return []*x509.Certificate{crt, inter}, nil
 					},
 				},
@@ -1186,7 +1312,7 @@ func TestOrderFinalize(t *testing.T) {
 				csr: csr,
 				sa: &mockSignAuth{
 					sign: func(csr *x509.CertificateRequest, pops provisioner.Options, signOps ...provisioner.SignOption) ([]*x509.Certificate, error) {
-						assert.Equals(t, len(signOps), 4)
+						assert.Equals(t, len(signOps), 5)
 						return []*x509.Certificate{crt, inter}, nil
 					},
 				},
@@ -1233,7 +1359,7 @@ func TestOrderFinalize(t *testing.T) {
 				csr: csr,
 				sa: &mockSignAuth{
 					sign: func(csr *x509.CertificateRequest, pops provisioner.Options, signOps ...provisioner.SignOption) ([]*x509.Certificate, error) {
-						assert.Equals(t, len(signOps), 4)
+						assert.Equals(t, len(signOps), 5)
 						return []*x509.Certificate{crt, inter}, nil
 					},
 				},
